@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""treemon – programok / processzfák összesített CPU- és memóriahasználata.
+
+Példák:
+  treemon                        top 20 program PSS szerint
+  treemon -n 10 -c               top 10 program CPU szerint
+  treemon 'firefox*' luakit      a megadott programok teljes processzfája
+  treemon -r 'fire|luak'         ugyanez reguláris kifejezéssel
+"""
+import argparse
+import curses
+import fnmatch
+import locale
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+
+import psutil
+
+MB = 2**20
+ATTRS = ["pid", "ppid", "name", "exe", "cpu_percent", "memory_info", "memory_full_info"]
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        prog="treemon",
+        description="Programok / processzfák összesített CPU- és memóriahasználata (PSS, USS, RSS).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,
+        epilog="""\
+csoportosítás:
+  minta nélkül   futtatható fájl szerint (a Firefox összes content process-e egy sor)
+  mintával       a találatok teljes processzfája (pl. luakit + WebKit-gyerekei)
+
+oszlopok:
+  PSS   arányos memória: a közös lapokat szétosztja, nem számol duplán
+  USS   csak az adott programé: ennyi szabadulna fel bezáráskor
+  RSS   minden lap teljes egészében: a közös memóriát többször számolja
+  CPU%  magonként értendő (4 mag teljes terhelése = 400%)
+  *     nem minden processz PSS/USS-e olvasható: futtasd sudo-val
+
+példák:
+  treemon                      top 20 program PSS szerint
+  treemon -n 10 -c             top 10 program CPU szerint
+  treemon -s uss               rendezés USS szerint
+  treemon -p -n 15             processzenként, nem programonként
+  treemon 'firefox*' luakit    a megadott programok processzfája
+  treemon -r 'fire|luak'       ugyanez reguláris kifejezéssel
+  treemon -i 1 'firefox*'      1 másodperces frissítéssel
+  treemon -1 -n 5              egyszeri kiírás, azonnal visszaadja a promptot
+
+billentyűk (élő nézetben):
+  q, Esc         kilépés
+  ↑ ↓ j k        görgetés soronként (egérgörgővel is)
+  PgUp PgDn      görgetés oldalanként
+  Home End g G   ugrás a lista elejére / végére
+  m u r c        rendezés PSS / USS / RSS / CPU szerint
+  p              váltás program / processz nézet között (minta nélkül)
+  szóköz         azonnali frissítés""",
+    )
+    ap._positionals.title = "argumentumok"
+    ap._optionals.title = "kapcsolók"
+    ap.add_argument("-h", "--help", action="help", help="ez a súgó")
+    ap.add_argument("patterns", nargs="*",
+                    help="programnév-minta, glob (pl. 'firefox*'); kis/nagybetű nem számít")
+    ap.add_argument("-r", "--regex", action="store_true",
+                    help="a minták reguláris kifejezések (részleges illeszkedés)")
+    ap.add_argument("-n", "--top", type=int, metavar="N",
+                    help="csak az első N sor (minta nélkül alapból 20)")
+    ap.add_argument("-m", dest="sort", action="store_const", const="pss",
+                    help="rendezés PSS szerint (alapértelmezett)")
+    ap.add_argument("-c", dest="sort", action="store_const", const="cpu",
+                    help="rendezés CPU szerint")
+    ap.add_argument("-s", "--sort", dest="sort", choices=("pss", "uss", "rss", "cpu"),
+                    help="rendezés a megadott oszlop szerint")
+    ap.add_argument("-p", "--per-process", action="store_true",
+                    help="minta nélkül: processzenként listáz, nem programonként")
+    ap.add_argument("-1", "--once", action="store_true",
+                    help="egyszeri kiírás, majd kilépés (szkriptekhez, pipe-hoz)")
+    ap.add_argument("-i", "--interval", type=float, default=2.0, metavar="SEC",
+                    help="frissítési időköz másodpercben (alap: 2)")
+    ap.set_defaults(sort="pss")
+    args = ap.parse_args()
+    if args.top is None and not args.patterns:
+        args.top = 20
+    return args
+
+
+def make_matcher(patterns, regex):
+    if regex:
+        rxs = [re.compile(p, re.IGNORECASE) for p in patterns]
+        return lambda name: any(r.search(name) for r in rxs)
+    pats = [p.lower() for p in patterns]
+    return lambda name: any(fnmatch.fnmatchcase(name.lower(), p) for p in pats)
+
+
+def snapshot():
+    """Egy mérés az összes processzről. A process_iter gyorsítótárazza a
+    Process objektumokat, így a cpu_percent két hívás közötti értéket ad."""
+    snap = {}
+    for p in psutil.process_iter(ATTRS, ad_value=None):
+        i = p.info
+        mi, full = i["memory_info"], i["memory_full_info"]
+        snap[i["pid"]] = {
+            "ppid": i["ppid"],
+            "name": i["name"] or "?",
+            "exe": i["exe"] or "",
+            "cpu": i["cpu_percent"] or 0.0,
+            "rss": mi.rss if mi else 0,
+            "pss": getattr(full, "pss", None),   # None: nincs jogosultság
+            "uss": getattr(full, "uss", None),
+        }
+    return snap
+
+
+def subtree(root, children):
+    out, stack = set(), [root]
+    while stack:
+        pid = stack.pop()
+        if pid not in out:
+            out.add(pid)
+            stack.extend(children[pid])
+    return out
+
+
+def tree_groups(snap, match):
+    """Minden illeszkedő processz, amelynek nincs illeszkedő őse, egy fa gyökere;
+    az azonos nevű gyökerek fái egy sorba kerülnek."""
+    children = defaultdict(list)
+    for pid, s in snap.items():
+        children[s["ppid"]].append(pid)
+    matched = {pid for pid, s in snap.items() if match(s["name"])}
+
+    def has_matched_ancestor(pid):
+        seen, ppid = set(), snap[pid]["ppid"]
+        while ppid in snap and ppid not in seen:
+            if ppid in matched:
+                return True
+            seen.add(ppid)
+            ppid = snap[ppid]["ppid"]
+        return False
+
+    groups = defaultdict(set)
+    for pid in matched:
+        if not has_matched_ancestor(pid):
+            groups[snap[pid]["name"]] |= subtree(pid, children)
+    return groups
+
+
+def exe_groups(snap, per_process):
+    groups = defaultdict(set)
+    for pid, s in snap.items():
+        if per_process:
+            key = f"{s['name']} [{pid}]"
+        else:
+            key = os.path.basename(s["exe"]) or s["name"]
+        groups[key].add(pid)
+    return groups
+
+
+def summarize(label, pids, snap):
+    r = {"label": label, "n": 0, "cpu": 0.0, "rss": 0, "pss": 0, "uss": 0,
+         "mem_n": 0, "partial": False}
+    for pid in pids:
+        s = snap.get(pid)
+        if s is None:
+            continue
+        r["n"] += 1
+        r["cpu"] += s["cpu"]
+        r["rss"] += s["rss"]
+        if s["pss"] is None:
+            r["partial"] = True
+        else:
+            r["pss"] += s["pss"]
+            r["uss"] += s["uss"]
+            r["mem_n"] += 1
+    return r
+
+
+def fmt_mem(r, key):
+    if r["mem_n"] == 0 and key != "rss":
+        return "-"
+    return f"{r[key] / MB:.0f}M" + ("*" if r["partial"] and key != "rss" else "")
+
+
+SORT_KEYS = {ord("m"): "pss", ord("u"): "uss", ord("r"): "rss", ord("c"): "cpu"}
+TABLE_HEADER = f"{'PROGRAM':<26} {'PROC':>4} {'CPU%':>7} {'PSS':>9} {'USS':>9} {'RSS':>9}"
+PARTIAL_NOTE = "* nem minden processz PSS/USS-e olvasható – futtasd sudo-val"
+KEYS_HELP = " q kilép  ↑↓ PgUp PgDn görget  m/u/r/c rendez  p program/processz  szóköz frissít"
+
+
+def group_rows(snap, args, match):
+    if match:
+        groups = tree_groups(snap, match)
+    else:
+        groups = exe_groups(snap, args.per_process)
+    rows = [summarize(label, pids, snap) for label, pids in groups.items()]
+    return [r for r in rows if r["n"]]
+
+
+def visible_rows(rows, args):
+    rows = sorted(rows, key=lambda r: r[args.sort], reverse=True)
+    return rows[:args.top] if args.top else rows
+
+
+def status_line(args):
+    vm = psutil.virtual_memory()
+    if args.patterns:
+        mode = "minták: " + " ".join(args.patterns)
+    else:
+        mode = "processzenként" if args.per_process else "programonként"
+    return (f"{time.strftime('%H:%M:%S')}  rendszer: CPU {psutil.cpu_percent():.0f}%  "
+            f"RAM {(vm.total - vm.available) / 2**30:.1f}/{vm.total / 2**30:.1f} GB  |  "
+            f"{mode}, rendezés: {args.sort}")
+
+
+def row_line(r):
+    return (f"{r['label'][:26]:<26} {r['n']:>4} {r['cpu']:>7.1f} "
+            f"{fmt_mem(r, 'pss'):>9} {fmt_mem(r, 'uss'):>9} {fmt_mem(r, 'rss'):>9}")
+
+
+def print_once(args, match):
+    """Egyszeri, sima szöveges kiírás: nem foglalja le a terminált."""
+    snapshot()                       # CPU-mérés inicializálása
+    time.sleep(1.0)
+    rows = visible_rows(group_rows(snapshot(), args, match), args)
+    lines = [status_line(args), "", TABLE_HEADER]
+    lines += [row_line(r) for r in rows] or ["(nincs találat)"]
+    if any(r["partial"] for r in rows):
+        lines += ["", PARTIAL_NOTE]
+    print("\n".join(lines))
+
+
+def put(scr, y, text, attr=0, fill=False):
+    h, w = scr.getmaxyx()
+    if not 0 <= y < h or w < 2:
+        return
+    if fill:
+        text = text.ljust(w - 1)
+    try:
+        scr.addnstr(y, 0, text, w - 1, attr)
+    except curses.error:
+        pass
+
+
+def draw(scr, rows, args, offset):
+    """Kirajzolja a képernyőt; visszaadja a korrigált görgetési pozíciót és
+    a táblázat látható sorainak számát."""
+    h, _ = scr.getmaxyx()
+    body_h = max(h - 5, 1)           # státusz, üres sor, fejléc + lent 2 sor
+    offset = max(0, min(offset, len(rows) - body_h))
+
+    scr.erase()
+    put(scr, 0, status_line(args), curses.A_BOLD)
+    put(scr, 2, TABLE_HEADER, curses.A_REVERSE, fill=True)
+    for i, r in enumerate(rows[offset:offset + body_h]):
+        put(scr, 3 + i, row_line(r))
+    if not rows:
+        put(scr, 3, "(nincs találat)")
+
+    notes = []
+    if len(rows) > body_h:
+        notes.append(f"{offset + 1}–{min(offset + body_h, len(rows))} / {len(rows)}")
+    if any(r["partial"] for r in rows):
+        notes.append(PARTIAL_NOTE)
+    put(scr, h - 2, "   ".join(notes), curses.A_DIM)
+    put(scr, h - 1, KEYS_HELP, curses.A_REVERSE, fill=True)
+    scr.refresh()
+    return offset, body_h
+
+
+def run_tui(scr, args, match):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    curses.use_default_colors()
+    scr.keypad(True)
+    scr.timeout(200)                 # getch legfeljebb 200 ms-ig vár
+    wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
+    wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
+    try:
+        curses.mousemask(wheel_up | wheel_down)
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
+
+    snapshot()                       # CPU-mérés inicializálása
+    time.sleep(min(args.interval, 1.0))
+    snap, next_refresh, offset, body_h = None, 0.0, 0, 1
+
+    while True:
+        now = time.monotonic()
+        if now >= next_refresh:
+            snap = snapshot()
+            next_refresh = now + args.interval
+        rows = visible_rows(group_rows(snap, args, match), args)
+        offset, body_h = draw(scr, rows, args, offset)
+
+        key = scr.getch()
+        if key == -1:
+            continue
+        if key in (ord("q"), ord("Q"), 27):
+            return
+        if key in (curses.KEY_UP, ord("k")):
+            offset -= 1
+        elif key in (curses.KEY_DOWN, ord("j")):
+            offset += 1
+        elif key == curses.KEY_PPAGE:
+            offset -= body_h
+        elif key == curses.KEY_NPAGE:
+            offset += body_h
+        elif key in (curses.KEY_HOME, ord("g")):
+            offset = 0
+        elif key in (curses.KEY_END, ord("G")):
+            offset = len(rows)
+        elif key in SORT_KEYS:
+            args.sort, offset = SORT_KEYS[key], 0
+        elif key == ord("p") and not args.patterns:
+            args.per_process, offset = not args.per_process, 0
+        elif key == ord(" "):
+            next_refresh = 0.0
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, _, _, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            if wheel_up and bstate & wheel_up:
+                offset -= 3
+            elif wheel_down and bstate & wheel_down:
+                offset += 3
+
+
+def main():
+    args = parse_args()
+    match = make_matcher(args.patterns, args.regex) if args.patterns else None
+    try:
+        if args.once or not sys.stdout.isatty():
+            print_once(args, match)
+        else:
+            locale.setlocale(locale.LC_ALL, "")       # ékezetek a curses-ban
+            os.environ.setdefault("ESCDELAY", "25")   # gyors Esc-kilépés
+            curses.wrapper(run_tui, args, match)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
