@@ -1,0 +1,78 @@
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "Használat: $0 <alkalmazásnév>"
+    exit 1
+fi
+
+app="$1"
+
+# A programnév alapján megkeressük a PGID-ket.
+mapfile -t groups < <(
+    ps -eo pgid=,comm= |
+    awk -v app="$app" 'index($2, app) > 0 {print $1}' |
+    sort -nu
+)
+
+if (( ${#groups[@]} == 0 )); then
+    echo "Nem található ilyen alkalmazás: $app"
+    exit 1
+fi
+
+# A kiválasztott folyamatcsoportok.
+declare -A selected
+for pgid in "${groups[@]}"; do
+    selected[$pgid]=1
+done
+
+# Minden folyamatot pontosan egyszer vizsgálunk.
+{
+    while read -r pid pgid comm cpu; do
+        [[ -n ${selected[$pgid]+x} ]] || continue
+
+        file="/proc/$pid/smaps_rollup"
+        [[ -r $file ]] || continue
+
+        # PSS és RSS kiolvasása KiB-ban.
+        read -r pss rss < <(
+            awk '
+                /^Pss:/ {pss=$2}
+                /^Rss:/ {rss=$2}
+                END {print pss+0, rss+0}
+            ' "$file" 2>/dev/null
+        )
+
+        printf '%s %s %s %s\n' \
+            "$pgid" "$pss" "$rss" "$cpu"
+
+    done < <(ps -eo pid=,pgid=,comm=,pcpu=)
+} | awk '
+{
+    pgid=$1
+    count[pgid]++
+    pss[pgid]+=$2
+    rss[pgid]+=$3
+    cpu[pgid]+=$4
+
+    total_count++
+    total_pss+=$2
+    total_rss+=$3
+    total_cpu+=$4
+}
+END {
+    printf "%-12s %8s %12s %12s %10s\n",
+        "PGID", "PROCESS", "PSS MiB", "RSS MiB", "CPU %"
+
+    for (g in count) {
+        printf "%-12s %8d %12.1f %12.1f %10.1f\n",
+            g, count[g], pss[g]/1024,
+            rss[g]/1024, cpu[g]
+    }
+
+    printf "\n%-12s %8d %12.1f %12.1f %10.1f\n",
+        "TOTAL", total_count,
+        total_pss/1024, total_rss/1024, total_cpu
+}'

@@ -1,0 +1,175 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Használat:
+  cgrun -l
+  cgrun [-m HIGH] [-M MAX] [-c CPU%] program [argumentumok...]
+
+Opciók:
+  -l  Aktív cgrun scope-ok listázása
+  -m  Memória-visszafogási küszöb (pl. 1G)
+  -M  Kemény memóriakorlát (pl. 2G)
+  -c  CPU-kvóta százalékban
+  -h  Súgó
+EOF
+}
+
+# Cgroup memóriaméret formázása
+human_size() {
+    local value="$1"
+
+    if [[ "$value" == "max" || -z "$value" ]]; then
+        printf '%s' "-"
+    else
+        numfmt --to=iec --suffix=B "$value"
+    fi
+}
+
+# cpu.max: kvóta / periódus
+cpu_limit() {
+    local quota period
+
+    read -r quota period < "$1"
+
+    if [[ "$quota" == "max" ]]; then
+        printf '%s' "-"
+    else
+        awk -v q="$quota" -v p="$period" \
+            'BEGIN {printf "%.0f%%", 100*q/p}'
+    fi
+}
+
+
+list_scopes() {
+    local unit cg base current high max cpu
+    local found=0
+
+    printf "%-36s %12s %12s %12s %10s\n" \
+        "SCOPE" "MEMORY" "HIGH" "MAX" "CPU LIMIT"
+
+    printf '%s\n' \
+        "------------------------------------------------------------------------------------------"
+
+    while read -r unit; do
+        [[ -n "$unit" ]] || continue
+
+        cg=$(systemctl --user show "$unit" \
+            -p ControlGroup --value)
+
+        base="/sys/fs/cgroup${cg}"
+
+        current="-"
+        high="-"
+        max="-"
+        cpu="-"
+
+        if [[ -n "$cg" && -r "$base/memory.current" ]]; then
+            current=$(human_size "$(<"$base/memory.current")")
+        fi
+
+        if [[ -n "$cg" && -r "$base/memory.high" ]]; then
+            high=$(human_size "$(<"$base/memory.high")")
+        fi
+
+        if [[ -n "$cg" && -r "$base/memory.max" ]]; then
+            max=$(human_size "$(<"$base/memory.max")")
+        fi
+
+        if [[ -n "$cg" && -r "$base/cpu.max" ]]; then
+            cpu=$(cpu_limit "$base/cpu.max")
+        fi
+
+        printf "%-36s %12s %12s %12s %10s\n" \
+            "$unit" "$current" "$high" "$max" "$cpu"
+
+        found=1
+
+    done < <(
+        systemctl --user list-units \
+            --type=scope \
+            --state=active \
+            --plain --no-legend --no-pager |
+        awk '$1 ~ /^cgrun-.*\.scope$/ {print $1}'
+    )
+
+    if (( found == 0 )); then
+        echo "Nincs aktív cgrun alkalmazás."
+    fi
+}
+
+
+mem_high=""
+mem_max=""
+cpu=""
+list=false
+
+while getopts ":lm:M:c:h" opt; do
+    case "$opt" in
+        l) list=true ;;
+        m) mem_high="$OPTARG" ;;
+        M) mem_max="$OPTARG" ;;
+        c) cpu="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        :) echo "Hiányzó érték: -$OPTARG" >&2; exit 1 ;;
+        \?) echo "Ismeretlen opció: -$OPTARG" >&2; exit 1 ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+if [[ "$list" == true ]]; then
+    if (( $# > 0 )) || [[ -n "$mem_high$mem_max$cpu" ]]; then
+        echo "A -l kapcsoló önállóan használható." >&2
+        exit 1
+    fi
+    list_scopes
+    exit 0
+fi
+
+if (( $# == 0 )); then
+    usage
+    exit 1
+fi
+
+size_re='^[0-9]+([KMGT])?$'
+
+for value in "$mem_high" "$mem_max"; do
+    if [[ -n "$value" && ! "$value" =~ $size_re ]]; then
+        echo "Hibás memóriaérték: $value" >&2
+        exit 1
+    fi
+done
+
+if [[ -n "$cpu" ]] &&
+   { [[ ! "$cpu" =~ ^[0-9]+$ ]] || (( 10#$cpu == 0 )); }; then
+    echo "A CPU-kvóta pozitív egész szám legyen." >&2
+    exit 1
+fi
+
+if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Nem található a program: $1" >&2
+    exit 1
+fi
+
+name=$(basename -- "$1")
+name=$(printf '%s' "$name" | tr -c 'a-zA-Z0-9_' '-')
+unit="cgrun-${name}-${BASHPID}.scope"
+
+args=(--user --scope "--unit=$unit")
+
+[[ -n "$mem_high" ]] &&
+    args+=(-p "MemoryHigh=$mem_high")
+
+[[ -n "$mem_max" ]] &&
+    args+=(-p "MemoryMax=$mem_max")
+
+[[ -n "$cpu" ]] &&
+    args+=(-p "CPUQuota=${cpu}%")
+
+echo "Indítás: $unit"
+echo "Parancs: $*"
+
+exec systemd-run "${args[@]}" -- "$@"
